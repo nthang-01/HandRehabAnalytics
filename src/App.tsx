@@ -1,29 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-type Finger = { name: string; flex: number; fsr: number };
-type Sample = {
-  timestamp: number;
-  time: string;
-  flex: number;
-  fsr: number;
-  fingerFlex: number[];
-  fingerFsr: number[];
-};
-type Session = {
-  id: number;
-  date: string;
-  duration: number;
-  avgFlex: number;
-  avgFsr: number;
-  samples: number;
-  fingerFlex: number[];
-  fingerFsr: number[];
-};
-type View = "overview" | "analytics" | "history";
-type Metric = "fingerFlex" | "fingerFsr";
-
-const NAMES = [
+const FINGERS = [
   "Ngón cái",
   "Ngón trỏ",
   "Ngón giữa",
@@ -31,1445 +9,1126 @@ const NAMES = [
   "Ngón út",
 ];
 
-const COLORS = [
-  "#D99A3D",
-  "#4D8FE8",
-  "#159782",
-  "#9470DB",
-  "#E47788",
-];
+const STORAGE_KEY = "hand-rehab-flex-sessions-v3";
 
-const INITIAL: Finger[] = [
-  { name: NAMES[0], flex: 32, fsr: 125 },
-  { name: NAMES[1], flex: 45, fsr: 180 },
-  { name: NAMES[2], flex: 52, fsr: 215 },
-  { name: NAMES[3], flex: 38, fsr: 155 },
-  { name: NAMES[4], flex: 25, fsr: 80 },
-];
+type Sample = {
+  time: number;
+  values: number[];
+};
 
-const SESSIONS_KEY = "hand-rehab-sessions-v2";
-const SAMPLES_KEY = "hand-rehab-latest-samples-v2";
+type Session = {
+  id: string;
+  name: string;
+  date: string;
+  duration: number;
+  fingerAverages: number[];
+  samples: Sample[];
+};
 
-function average(values: number[]) {
-  return values.length
-    ? Math.round(
-        values.reduce((a, b) => a + b, 0) / values.length,
-      )
-    : 0;
+type Page = "overview" | "analysis" | "history";
+
+const INITIAL_VALUES = [32, 45, 52, 38, 25];
+
+function calculateFingerAverages(samples: Sample[]): number[] {
+  return FINGERS.map((_, fingerIndex) => {
+    const values = samples
+      .map((sample) => sample.values[fingerIndex])
+      .filter((value) => Number.isFinite(value));
+
+    if (values.length === 0) return 0;
+
+    return (
+      values.reduce((sum, value) => sum + value, 0) /
+      values.length
+    );
+  });
 }
 
-function formatTime(total: number) {
-  const s = Math.max(0, Math.floor(total));
-
-  return [
-    Math.floor(s / 3600),
-    Math.floor((s % 3600) / 60),
-    s % 60,
-  ]
-    .map((v) => String(v).padStart(2, "0"))
-    .join(":");
+function formatDate(date: string): string {
+  return new Date(date).toLocaleString("vi-VN", {
+    dateStyle: "short",
+    timeStyle: "short",
+  });
 }
 
-function formatDate(value: number | string) {
-  const date = new Date(value);
+function formatDuration(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
 
-  return Number.isNaN(date.getTime())
-    ? String(value)
-    : date.toLocaleString("vi-VN", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
+  return `${minutes} phút ${remainingSeconds} giây`;
 }
 
-function readStorage<T>(key: string, fallback: T): T {
+function loadSessions(): Session[] {
   try {
-    const value = localStorage.getItem(key);
-    return value ? (JSON.parse(value) as T) : fallback;
+    const saved = localStorage.getItem(STORAGE_KEY);
+
+    if (!saved) return [];
+
+    const parsed: unknown = JSON.parse(saved);
+
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter(
+      (item): item is Session =>
+        item !== null &&
+        typeof item === "object" &&
+        typeof item.id === "string" &&
+        typeof item.name === "string" &&
+        typeof item.date === "string" &&
+        typeof item.duration === "number" &&
+        Array.isArray(item.fingerAverages) &&
+        Array.isArray(item.samples)
+    );
   } catch {
-    return fallback;
+    return [];
   }
 }
 
-function downloadCSV(
-  filename: string,
-  rows: (string | number)[][],
-) {
-  const csv =
-    "\uFEFF" +
-    rows
-      .map((row) =>
-        row
-          .map(
-            (value) =>
-              `"${String(value).replace(/"/g, '""')}"`,
-          )
-          .join(","),
-      )
-      .join("\r\n");
-
-  const blob = new Blob([csv], {
-    type: "text/csv;charset=utf-8;",
-  });
-
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-
-  link.href = url;
-  link.download = filename;
-
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
+/* Biểu đồ đường SVG, không cần thư viện bên ngoài */
 function LineChart({
   title,
-  subtitle,
-  data,
-  colors,
-  maxValue,
-  unit,
-  multi = false,
+  samples,
+  fingerIndex,
+  color,
 }: {
   title: string;
-  subtitle: string;
-  data: number[][];
-  colors: string[];
-  maxValue: number;
-  unit: string;
-  multi?: boolean;
+  samples: Sample[];
+  fingerIndex: number;
+  color: string;
 }) {
-  const width = 760;
-  const height = 260;
-  const left = 48;
-  const right = 18;
-  const top = 18;
-  const bottom = 34;
+  const width = 700;
+  const height = 250;
+  const paddingLeft = 42;
+  const paddingRight = 16;
+  const paddingTop = 20;
+  const paddingBottom = 34;
 
-  const chartW = width - left - right;
-  const chartH = height - top - bottom;
-  const series = data.length ? data : [[]];
-  const hasData = series.some((s) => s.length > 0);
+  const plotWidth = width - paddingLeft - paddingRight;
+  const plotHeight = height - paddingTop - paddingBottom;
+
+  const values = samples.map(
+    (sample) => sample.values[fingerIndex] ?? 0
+  );
+
+  const points = values.map((value, index) => {
+    const x =
+      paddingLeft +
+      (values.length <= 1
+        ? plotWidth / 2
+        : (index / (values.length - 1)) * plotWidth);
+
+    const y =
+      paddingTop + ((100 - value) / 100) * plotHeight;
+
+    return { x, y, value };
+  });
+
+  const linePath = points
+    .map(
+      (point, index) =>
+        `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`
+    )
+    .join(" ");
 
   return (
-    <section className="panel">
-      <div className="panel-heading">
-        <div>
-          <h2>{title}</h2>
-          <p>{subtitle}</p>
-        </div>
-
-        <span className="unit-pill">{unit}</span>
+    <section className="chart-card">
+      <div className="chart-heading">
+        <h3>{title}</h3>
+        <span className="chart-unit">Thang hiển thị 0–100</span>
       </div>
 
-      {!hasData ? (
-        <div className="empty-state">
-          Chưa có dữ liệu. Hãy bắt đầu phiên tập để ghi các mẫu cảm biến.
+      {samples.length === 0 ? (
+        <div className="empty-chart">
+          Chưa có dữ liệu để vẽ biểu đồ.
         </div>
       ) : (
-        <>
-          <div className="chart-scroll">
-            <svg
-              className="line-chart"
-              viewBox={`0 0 ${width} ${height}`}
-              role="img"
-              aria-label={title}
+        <div className="chart-scroll">
+          <svg
+            className="line-chart"
+            viewBox={`0 0 ${width} ${height}`}
+            role="img"
+            aria-label={title}
+          >
+            {[0, 25, 50, 75, 100].map((tick) => {
+              const y =
+                paddingTop + ((100 - tick) / 100) * plotHeight;
+
+              return (
+                <g key={tick}>
+                  <line
+                    x1={paddingLeft}
+                    y1={y}
+                    x2={width - paddingRight}
+                    y2={y}
+                    className="chart-grid-line"
+                  />
+                  <text
+                    x={paddingLeft - 9}
+                    y={y + 4}
+                    textAnchor="end"
+                    className="chart-label"
+                  >
+                    {tick}
+                  </text>
+                </g>
+              );
+            })}
+
+            <line
+              x1={paddingLeft}
+              y1={paddingTop}
+              x2={paddingLeft}
+              y2={height - paddingBottom}
+              className="chart-axis"
+            />
+
+            <line
+              x1={paddingLeft}
+              y1={height - paddingBottom}
+              x2={width - paddingRight}
+              y2={height - paddingBottom}
+              className="chart-axis"
+            />
+
+            {linePath && (
+              <path
+                d={linePath}
+                fill="none"
+                stroke={color}
+                strokeWidth="2.5"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+              />
+            )}
+
+            {points.map((point, index) => (
+              <circle
+                key={index}
+                cx={point.x}
+                cy={point.y}
+                r="3"
+                fill={color}
+              >
+                <title>
+                  Mẫu {index + 1}: {point.value.toFixed(2)}
+                </title>
+              </circle>
+            ))}
+
+            <text
+              x={paddingLeft}
+              y={height - 9}
+              className="chart-label"
             >
-              {[0, 0.25, 0.5, 0.75, 1].map((r) => {
-                const y = top + chartH * r;
+              Mẫu đầu
+            </text>
 
-                return (
-                  <g key={r}>
-                    <line
-                      x1={left}
-                      y1={y}
-                      x2={width - right}
-                      y2={y}
-                      stroke="#e7edf4"
-                      strokeDasharray="4 5"
-                    />
-
-                    <text
-                      x={left - 9}
-                      y={y + 4}
-                      textAnchor="end"
-                      fontSize="11"
-                      fill="#8794a8"
-                    >
-                      {Math.round(maxValue * (1 - r))}
-                    </text>
-                  </g>
-                );
-              })}
-
-              {series.map((values, si) => {
-                if (!values.length) return null;
-
-                const points = values
-                  .map((v, i) => {
-                    const x =
-                      left +
-                      (i / Math.max(1, values.length - 1)) *
-                        chartW;
-
-                    const y =
-                      top +
-                      chartH -
-                      (Math.max(0, Math.min(maxValue, v)) /
-                        maxValue) *
-                        chartH;
-
-                    return `${x},${y}`;
-                  })
-                  .join(" ");
-
-                return (
-                  <g key={si}>
-                    <polyline
-                      points={points}
-                      fill="none"
-                      stroke={colors[si % colors.length]}
-                      strokeWidth="2.7"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-
-                    {values.length <= 18 &&
-                      values.map((v, i) => (
-                        <circle
-                          key={i}
-                          cx={
-                            left +
-                            (i /
-                              Math.max(1, values.length - 1)) *
-                              chartW
-                          }
-                          cy={
-                            top +
-                            chartH -
-                            (Math.max(0, Math.min(maxValue, v)) /
-                              maxValue) *
-                              chartH
-                          }
-                          r="3"
-                          fill={colors[si % colors.length]}
-                        />
-                      ))}
-                  </g>
-                );
-              })}
-
-              <text
-                x={left}
-                y={height - 8}
-                fontSize="11"
-                fill="#8794a8"
-              >
-                Mẫu đầu
-              </text>
-
-              <text
-                x={width - right}
-                y={height - 8}
-                textAnchor="end"
-                fontSize="11"
-                fill="#8794a8"
-              >
-                Mẫu mới nhất
-              </text>
-            </svg>
-          </div>
-
-          {multi && (
-            <div className="legend">
-              {NAMES.map((name, i) => (
-                <span className="legend-item" key={name}>
-                  <i style={{ background: COLORS[i] }} />
-                  {name}
-                </span>
-              ))}
-            </div>
-          )}
-
-          <p className="chart-note">
-            {series[0]?.length ?? 0} mẫu đang hiển thị ·{" "}
-            {multi
-              ? "Mỗi màu tương ứng một ngón tay"
-              : "Giá trị trung bình của 5 ngón"}
-          </p>
-        </>
+            <text
+              x={width - paddingRight}
+              y={height - 9}
+              textAnchor="end"
+              className="chart-label"
+            >
+              Mẫu cuối
+            </text>
+          </svg>
+        </div>
       )}
     </section>
   );
 }
 
-function HandDiagram({
-  fingers,
-  selected,
-  onSelect,
+/* Biểu đồ cột cho giá trị trung bình của từng ngón */
+function FingerAverageChart({
+  values,
 }: {
-  fingers: Finger[];
-  selected: number;
-  onSelect: (i: number) => void;
+  values: number[];
 }) {
-  const shapes = [
-    { x: 48, y: 100, w: 39, h: 88 },
-    { x: 94, y: 49, w: 37, h: 132 },
-    { x: 139, y: 25, w: 38, h: 156 },
-    { x: 184, y: 55, w: 37, h: 126 },
-    { x: 229, y: 91, w: 36, h: 90 },
-  ];
-
   return (
-    <div className="hand-wrap">
-      <svg
-        viewBox="0 0 320 300"
-        role="img"
-        aria-label="Bản đồ bàn tay 5 ngón"
-        className="hand-svg"
-      >
-        <ellipse
-          cx="160"
-          cy="276"
-          rx="90"
-          ry="8"
-          fill="#142e3b"
-          opacity=".07"
-        />
+    <section className="chart-card">
+      <div className="chart-heading">
+        <h3>Flex trung bình của 5 ngón</h3>
+        <span className="chart-unit">Từng ngón riêng biệt</span>
+      </div>
 
-        {shapes.map((s, i) => (
-          <g
-            key={NAMES[i]}
-            role="button"
-            tabIndex={0}
-            aria-label={`Chọn ${NAMES[i]}`}
-            onClick={() => onSelect(i)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onSelect(i);
-              }
-            }}
-            style={{ cursor: "pointer" }}
-          >
-            <rect
-              x={s.x}
-              y={s.y}
-              width={s.w}
-              height={s.h}
-              rx={s.w / 2}
-              fill={selected === i ? COLORS[i] : "#d8e7e3"}
-              stroke={selected === i ? COLORS[i] : "#b9d0ca"}
-              strokeWidth={selected === i ? 3 : 1.5}
-            />
+      <div className="finger-bars">
+        {FINGERS.map((finger, index) => {
+          const value = values[index] ?? 0;
 
-            <line
-              x1={s.x + 6}
-              y1={s.y + s.h * 0.5}
-              x2={s.x + s.w - 6}
-              y2={s.y + s.h * 0.5}
-              stroke={selected === i ? "#fff" : "#abc6bf"}
-              strokeWidth="2"
-            />
+          return (
+            <div className="finger-bar-row" key={finger}>
+              <span className="finger-bar-name">{finger}</span>
 
-            <text
-              x={s.x + s.w / 2}
-              y={s.y - 8}
-              textAnchor="middle"
-              fontSize="11"
-              fontWeight="700"
-              fill={COLORS[i]}
-            >
-              {fingers[i].flex}%
-            </text>
-          </g>
-        ))}
+              <div className="finger-bar-track">
+                <div
+                  className="finger-bar-fill"
+                  style={{
+                    width: `${Math.max(
+                      0,
+                      Math.min(100, value)
+                    )}%`,
+                  }}
+                />
+              </div>
 
-        <path
-          d="M73 163 Q77 145 95 155 L119 178 L123 168 Q129 155 143 161 L160 165 L177 160 Q193 157 196 176 L200 188 L215 174 Q229 166 237 181 L242 198 L242 215 Q239 254 201 258 L142 258 Q101 256 96 219 Z"
-          fill="#dceee9"
-          stroke="#b9d0ca"
-          strokeWidth="1.5"
-        />
+              <strong className="finger-bar-value">
+                {value.toFixed(2)}
+              </strong>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
-        <path
-          d="M124 202 Q160 186 208 203 M137 229 Q165 241 195 229"
-          fill="none"
-          stroke="#b3d1c9"
-          strokeWidth="2"
-          strokeLinecap="round"
-        />
+function FingerCards({
+  values,
+}: {
+  values: number[];
+}) {
+  return (
+    <div className="finger-grid">
+      {FINGERS.map((finger, index) => (
+        <article className="finger-card" key={finger}>
+          <div className="finger-card-top">
+            <span className={`finger-dot finger-dot-${index}`} />
+            <span>{finger}</span>
+          </div>
 
-        <text
-          x="160"
-          y="290"
-          textAnchor="middle"
-          fontSize="11"
-          fill="#718096"
-        >
-          Chọn một ngón để xem chỉ số
-        </text>
-      </svg>
+          <div className="finger-number">
+            {(values[index] ?? 0).toFixed(2)}
+          </div>
+
+          <div className="finger-card-caption">
+            Flex trung bình
+          </div>
+        </article>
+      ))}
     </div>
   );
 }
 
 export default function App() {
-  const [fingers, setFingers] = useState<Finger[]>(INITIAL);
-  const fingersRef = useRef<Finger[]>(INITIAL);
-  const [isRecording, setIsRecording] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [selectedFinger, setSelectedFinger] = useState(2);
-  const [view, setView] = useState<View>("overview");
-  const [metric, setMetric] = useState<Metric>("fingerFlex");
-
-  const [samples, setSamples] = useState<Sample[]>(() =>
-    readStorage(SAMPLES_KEY, [] as Sample[]),
-  );
+  const [page, setPage] = useState<Page>("overview");
 
   const [sessions, setSessions] = useState<Session[]>(() =>
-    readStorage(SESSIONS_KEY, [] as Session[]),
+    loadSessions()
   );
 
-  const [sessionStart, setSessionStart] = useState<number | null>(
-    null,
-  );
+  const [selectedSessionId, setSelectedSessionId] =
+    useState<string>("");
 
-  const [notice, setNotice] = useState(
-    "Dữ liệu đang ở chế độ mô phỏng; chưa kết nối ESP32.",
-  );
+  const [sessionName, setSessionName] = useState("Phiên tập mới");
 
-  const [sessionLabel, setSessionLabel] = useState("Phiên tập");
+  const [isRecording, setIsRecording] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  useEffect(() => {
-    fingersRef.current = fingers;
-  }, [fingers]);
+  const [currentValues, setCurrentValues] =
+    useState<number[]>(INITIAL_VALUES);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
-    } catch {
-      setNotice(
-        "Không thể lưu lịch sử: bộ nhớ trình duyệt có thể đã đầy.",
-      );
-    }
-  }, [sessions]);
+  const [currentSamples, setCurrentSamples] = useState<Sample[]>([
+    { time: 0, values: INITIAL_VALUES },
+  ]);
+
+  const [notice, setNotice] = useState("");
 
   useEffect(() => {
     try {
       localStorage.setItem(
-        SAMPLES_KEY,
-        JSON.stringify(samples.slice(-300)),
+        STORAGE_KEY,
+        JSON.stringify(sessions)
       );
     } catch {
-      // Bộ nhớ mẫu cảm biến là tùy chọn.
+      setNotice(
+        "Không thể lưu dữ liệu vào trình duyệt. Hãy kiểm tra dung lượng lưu trữ."
+      );
     }
-  }, [samples]);
+  }, [sessions]);
 
+  /* Mô phỏng giá trị Flex mỗi giây khi đang ghi */
   useEffect(() => {
     if (!isRecording) return;
 
     const timer = window.setInterval(() => {
-      setElapsed((v) => v + 1);
+      setElapsedSeconds((seconds) => seconds + 1);
+
+      setCurrentValues((previous) => {
+        const next = previous.map((value) => {
+          const change = (Math.random() - 0.5) * 8;
+
+          return Math.max(
+            0,
+            Math.min(100, value + change)
+          );
+        });
+
+        setCurrentSamples((samples) => [
+          ...samples,
+          {
+            time: samples.length,
+            values: next,
+          },
+        ]);
+
+        return next;
+      });
     }, 1000);
 
     return () => window.clearInterval(timer);
   }, [isRecording]);
 
-  useEffect(() => {
-    if (!isRecording) return;
-
-    const timer = window.setInterval(() => {
-      const updated = fingersRef.current.map((finger) => ({
-        ...finger,
-        flex: Math.max(
-          0,
-          Math.min(
-            100,
-            Math.round(finger.flex + (Math.random() - 0.48) * 12),
-          ),
-        ),
-        fsr: Math.max(
-          0,
-          Math.min(
-            1023,
-            Math.round(finger.fsr + (Math.random() - 0.48) * 38),
-          ),
-        ),
-      }));
-
-      fingersRef.current = updated;
-      setFingers(updated);
-
-      const sample: Sample = {
-        timestamp: Date.now(),
-        time: new Date().toLocaleTimeString("vi-VN"),
-        flex: average(updated.map((f) => f.flex)),
-        fsr: average(updated.map((f) => f.fsr)),
-        fingerFlex: updated.map((f) => f.flex),
-        fingerFsr: updated.map((f) => f.fsr),
-      };
-
-      setSamples((old) => [...old.slice(-299), sample]);
-    }, 1200);
-
-    return () => window.clearInterval(timer);
-  }, [isRecording]);
-
-  const averageFlex = average(fingers.map((f) => f.flex));
-  const averageFsr = average(fingers.map((f) => f.fsr));
-
-  const totalDuration = sessions.reduce(
-    (sum, s) => sum + s.duration,
-    0,
+  const currentFingerAverages = useMemo(
+    () => calculateFingerAverages(currentSamples),
+    [currentSamples]
   );
 
-  const selected = fingers[selectedFinger] ?? fingers[0];
-
-  const flexRange =
-    Math.max(...fingers.map((f) => f.flex)) -
-    Math.min(...fingers.map((f) => f.flex));
-
-  const fsrRange =
-    Math.max(...fingers.map((f) => f.fsr)) -
-    Math.min(...fingers.map((f) => f.fsr));
-
-  const averageFlexSeries = useMemo(
-    () => samples.map((s) => s.flex),
-    [samples],
+  const selectedSession = sessions.find(
+    (session) => session.id === selectedSessionId
   );
 
-  const averageFsrSeries = useMemo(
-    () => samples.map((s) => s.fsr),
-    [samples],
-  );
+  const latestSession = sessions[0];
 
-  const fingerSeries = useMemo(
-    () =>
-      NAMES.map((_, i) =>
-        samples.map((s) => s[metric][i] ?? 0),
-      ),
-    [samples, metric],
-  );
+  const sessionTrend = [...sessions].reverse();
 
   function startRecording() {
-    if (isRecording) return;
+    setCurrentSamples([
+      {
+        time: 0,
+        values: [...currentValues],
+      },
+    ]);
 
-    setSamples([]);
-    setElapsed(0);
-    setSessionStart(Date.now());
-    setIsRecording(true);
-
-    setNotice(
-      "Đã bắt đầu phiên tập. Dữ liệu cảm biến hiện đang được mô phỏng.",
+    setElapsedSeconds(0);
+    setSessionName(
+      `Phiên tập ${sessions.length + 1}`
     );
+    setNotice("");
+    setIsRecording(true);
   }
 
   function stopRecording() {
-    if (!isRecording) return;
+    setIsRecording(false);
+  }
 
-    const start = sessionStart ?? Date.now();
+  function saveSession() {
+    if (isRecording) {
+      setNotice("Hãy dừng ghi trước khi lưu phiên.");
+      return;
+    }
 
-    const duration = Math.max(
-      elapsed,
-      Math.floor((Date.now() - start) / 1000),
-    );
+    if (currentSamples.length === 0) {
+      setNotice("Chưa có dữ liệu để lưu.");
+      return;
+    }
 
-    const captured = samples;
+    const fingerAverages =
+      calculateFingerAverages(currentSamples);
 
-    const avgFlex = captured.length
-      ? average(captured.map((s) => s.flex))
-      : averageFlex;
-
-    const avgFsr = captured.length
-      ? average(captured.map((s) => s.fsr))
-      : averageFsr;
-
-    const fingerFlex = NAMES.map((_, i) =>
-      captured.length
-        ? average(captured.map((s) => s.fingerFlex[i] ?? 0))
-        : fingers[i].flex,
-    );
-
-    const fingerFsr = NAMES.map((_, i) =>
-      captured.length
-        ? average(captured.map((s) => s.fingerFsr[i] ?? 0))
-        : fingers[i].fsr,
-    );
-
-    const session: Session = {
-      id: Date.now(),
-      date: formatDate(start),
-      duration,
-      avgFlex,
-      avgFsr,
-      samples: captured.length,
-      fingerFlex,
-      fingerFsr,
+    const newSession: Session = {
+      id: `${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+      name: sessionName.trim() || "Phiên tập không tên",
+      date: new Date().toISOString(),
+      duration: elapsedSeconds,
+      fingerAverages,
+      samples: currentSamples.map((sample) => ({
+        ...sample,
+        values: [...sample.values],
+      })),
     };
 
-    setSessions((old) => [session, ...old].slice(0, 100));
-    setIsRecording(false);
-    setSessionStart(null);
+    setSessions((previous) => [
+      newSession,
+      ...previous,
+    ]);
 
-    setNotice(
-      `Đã lưu "${sessionLabel || "Phiên tập"}" vào lịch sử trên trình duyệt này.`,
+    setSelectedSessionId(newSession.id);
+    setNotice("Đã lưu phiên tập luyện.");
+    setPage("analysis");
+  }
+
+  function deleteSession(id: string) {
+    const confirmed = window.confirm(
+      "Bạn có chắc muốn xóa phiên tập này?"
+    );
+
+    if (!confirmed) return;
+
+    setSessions((previous) =>
+      previous.filter((session) => session.id !== id)
+    );
+
+    if (selectedSessionId === id) {
+      setSelectedSessionId("");
+    }
+
+    setNotice("Đã xóa phiên tập.");
+  }
+
+  function exportSessionCSV(session: Session) {
+    const rows = [
+      [
+        "Thoi gian mau (s)",
+        ...FINGERS,
+      ],
+      ...session.samples.map((sample) => [
+        String(sample.time),
+        ...FINGERS.map((_, index) =>
+          (sample.values[index] ?? 0).toFixed(4)
+        ),
+      ]),
+      [],
+      ["Flex trung binh tung ngon"],
+      ...FINGERS.map((finger, index) => [
+        finger,
+        (session.fingerAverages[index] ?? 0).toFixed(4),
+      ]),
+    ];
+
+    downloadCSV(
+      rows,
+      `${session.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.csv`
     );
   }
 
-  function exportSamples() {
-    if (!samples.length) {
-      setNotice(
-        "Chưa có mẫu dữ liệu để xuất. Hãy bắt đầu phiên tập trước.",
-      );
-      return;
-    }
-
-    downloadCSV("hand-rehab-sensor-data.csv", [
+  function exportAllSessionsCSV() {
+    const rows: (string | number)[][] = [
       [
-        "Timestamp",
-        "Thời gian",
-        "Ngón tay",
-        "Flex (%)",
-        "FSR (raw)",
+        "Ten phien",
+        "Ngay gio",
+        "Thoi luong (s)",
+        ...FINGERS.map((finger) => `${finger} - Flex TB`),
       ],
-      ...samples.flatMap((s) =>
-        NAMES.map((name, i) => [
-          s.timestamp,
-          s.time,
-          name,
-          s.fingerFlex[i] ?? 0,
-          s.fingerFsr[i] ?? 0,
-        ]),
-      ),
-    ]);
+    ];
+
+    sessions.forEach((session) => {
+      rows.push([
+        session.name,
+        formatDate(session.date),
+        session.duration,
+        ...FINGERS.map((_, index) =>
+          (session.fingerAverages[index] ?? 0).toFixed(4)
+        ),
+      ]);
+    });
+
+    downloadCSV(rows, "hand-rehab-sessions.csv");
   }
 
-  function exportHistory() {
-    downloadCSV("hand-rehab-session-history.csv", [
-      [
-        "ID",
-        "Thời điểm bắt đầu",
-        "Thời lượng (giây)",
-        "Flex trung bình (%)",
-        "FSR trung bình (raw)",
-        "Số mẫu",
-        ...NAMES.flatMap((n) => [
-          `${n} Flex (%)`,
-          `${n} FSR (raw)`,
-        ]),
-      ],
-      ...sessions.map((s) => [
-        s.id,
-        s.date,
-        s.duration,
-        s.avgFlex,
-        s.avgFsr,
-        s.samples,
-        ...NAMES.flatMap((_, i) => [
-          s.fingerFlex?.[i] ?? "",
-          s.fingerFsr?.[i] ?? "",
-        ]),
-      ]),
-    ]);
-  }
-
-  function clearHistory() {
-    if (
-      !window.confirm(
-        "Bạn có chắc muốn xóa toàn bộ lịch sử phiên tập đã lưu trên trình duyệt này?",
+  function downloadCSV(
+    rows: (string | number)[][],
+    filename: string
+  ) {
+    const csv = rows
+      .map((row) =>
+        row
+          .map((cell) => {
+            const value = String(cell ?? "");
+            return `"${value.replace(/"/g, '""')}"`;
+          })
+          .join(",")
       )
-    ) {
+      .join("\r\n");
+
+    const blob = new Blob(["\uFEFF" + csv], {
+      type: "text/csv;charset=utf-8;",
+    });
+
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+
+    URL.revokeObjectURL(url);
+  }
+
+  function resetCurrentData() {
+    if (isRecording) {
+      setNotice("Hãy dừng phiên trước khi làm mới.");
       return;
     }
 
-    setSessions([]);
-    setNotice("Đã xóa lịch sử phiên tập.");
+    setElapsedSeconds(0);
+    setCurrentValues([...INITIAL_VALUES]);
+    setCurrentSamples([
+      { time: 0, values: [...INITIAL_VALUES] },
+    ]);
+    setNotice("Đã làm mới dữ liệu phiên hiện tại.");
   }
 
   return (
-    <div className="app-layout">
+    <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-icon">H</div>
+          <div className="brand-icon">HR</div>
           <div>
             <h1>Hand Rehab</h1>
-            <p>Analytics platform</p>
+            <p>Analytics Dashboard</p>
           </div>
         </div>
 
-        <p className="nav-label">WORKSPACE</p>
+        <div className="nav-label">MENU CHÍNH</div>
 
-        <nav className="nav" aria-label="Điều hướng chính">
+        <nav className="navigation">
           <button
-            className={view === "overview" ? "active" : ""}
-            onClick={() => setView("overview")}
+            className={`nav-button ${
+              page === "overview" ? "active" : ""
+            }`}
+            onClick={() => setPage("overview")}
           >
-            <span>▦</span>
-            Tổng quan
+            <span>▦</span> Tổng quan
           </button>
 
           <button
-            className={view === "analytics" ? "active" : ""}
-            onClick={() => setView("analytics")}
+            className={`nav-button ${
+              page === "analysis" ? "active" : ""
+            }`}
+            onClick={() => setPage("analysis")}
           >
-            <span>⌁</span>
-            Phân tích
+            <span>⌁</span> Phân tích Flex
           </button>
 
           <button
-            className={view === "history" ? "active" : ""}
-            onClick={() => setView("history")}
+            className={`nav-button ${
+              page === "history" ? "active" : ""
+            }`}
+            onClick={() => setPage("history")}
           >
-            <span>◷</span>
-            Lịch sử phiên tập
+            <span>◷</span> Lịch sử phiên
           </button>
         </nav>
 
-        <div className="sidebar-device">
-          <p className="nav-label">THIẾT BỊ</p>
-
-          <div className="device-card">
-            <span className="device-dot" />
-            <strong>Chế độ mô phỏng</strong>
-            <p>
-              Chưa kết nối ESP32. Dữ liệu không phải số đo thực tế.
-            </p>
+        <div className="sidebar-bottom">
+          <div className="status-indicator">
+            <span className="status-dot" />
+            <div>
+              <strong>Chế độ mô phỏng</strong>
+              <p>Chưa kết nối ESP32</p>
+            </div>
           </div>
-        </div>
-
-        <div className="sidebar-foot">
-          HAND REHAB ANALYTICS
-          <br />
-          Prototype · v2.0
         </div>
       </aside>
 
-      <main className="main">
+      <main className="main-content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">REHABILITATION WORKSPACE</p>
+            <div className="breadcrumb">
+              Hand Rehab /{" "}
+              {page === "overview"
+                ? "Tổng quan"
+                : page === "analysis"
+                  ? "Phân tích Flex"
+                  : "Lịch sử phiên"}
+            </div>
 
-            <h1>
-              {view === "overview"
-                ? "Tổng quan phục hồi"
-                : view === "analytics"
-                  ? "Phân tích cảm biến"
-                  : "Lịch sử phiên tập"}
-            </h1>
-
-            <p className="page-subtitle">
-              Theo dõi chuyển động ngón tay và lực nắm theo thời gian.
-            </p>
+            <h2>
+              {page === "overview"
+                ? "Tổng quan vận động bàn tay"
+                : page === "analysis"
+                  ? "Phân tích Flex"
+                  : "Lịch sử tập luyện"}
+            </h2>
           </div>
 
-          <div className="header-actions">
-            <span
-              className={`status-badge ${
-                isRecording ? "recording" : ""
-              }`}
-            >
-              <i />
-              {isRecording ? "Đang ghi dữ liệu" : "Sẵn sàng"}
-            </span>
-
-            <button
-              className="btn btn-light"
-              onClick={exportSamples}
-              disabled={!samples.length}
-            >
-              ↓ Xuất dữ liệu
-            </button>
+          <div className="topbar-status">
+            <span className="status-dot" />
+            Dữ liệu mô phỏng
           </div>
         </header>
 
         {notice && (
           <div className="notice" role="status">
-            <span>ⓘ</span>
-            {notice}
-
+            <span>{notice}</span>
             <button
-              aria-label="Ẩn thông báo"
+              className="notice-close"
               onClick={() => setNotice("")}
+              aria-label="Đóng thông báo"
             >
               ×
             </button>
           </div>
         )}
 
-        {view !== "history" && (
+        {page === "overview" && (
           <>
-            <section className="stats-grid">
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon teal">↗</span>
-                  <span className="stat-label">FLEX TRUNG BÌNH</span>
-                </div>
-                <div className="stat-value">
-                  {averageFlex}
-                  <small>%</small>
-                </div>
-                <p className="stat-description">
-                  Trung bình của 5 ngón tay
+            <section className="intro-row">
+              <div>
+                <h3>Theo dõi Flex của 5 ngón tay</h3>
+                <p>
+                  Ghi nhận dữ liệu, xem biểu đồ và so sánh
+                  kết quả giữa các phiên tập.
                 </p>
               </div>
 
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon blue">◉</span>
-                  <span className="stat-label">FSR TRUNG BÌNH</span>
-                </div>
-                <div className="stat-value">{averageFsr}</div>
-                <p className="stat-description">
-                  Tín hiệu ADC mô phỏng (raw)
-                </p>
-              </div>
-
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon purple">◷</span>
-                  <span className="stat-label">THỜI GIAN TẬP</span>
-                </div>
-                <div className="stat-value time-value">
-                  {formatTime(elapsed)}
-                </div>
-                <p className="stat-description">
-                  {isRecording
-                    ? "Đang ghi dữ liệu"
-                    : "Thời gian phiên hiện tại"}
-                </p>
-              </div>
-
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon orange">▤</span>
-                  <span className="stat-label">PHIÊN ĐÃ LƯU</span>
-                </div>
-                <div className="stat-value">{sessions.length}</div>
-                <p className="stat-description">
-                  Tổng thời lượng {formatTime(totalDuration)}
-                </p>
+              <div className="recording-badge">
+                <span
+                  className={`status-dot ${
+                    isRecording ? "recording-dot" : ""
+                  }`}
+                />
+                {isRecording ? "Đang ghi dữ liệu" : "Đang chờ"}
               </div>
             </section>
 
-            {view === "overview" && (
-              <>
-                <div className="content-grid overview-grid">
-                  <section className="panel">
-                    <div className="panel-heading">
-                      <div>
-                        <h2>Bản đồ ngón tay</h2>
-                        <p>
-                          Chọn ngón để xem dữ liệu cảm biến hiện tại.
-                        </p>
-                      </div>
+            <section className="control-panel">
+              <div className="control-heading">
+                <div>
+                  <h3>Phiên tập hiện tại</h3>
+                  <p>
+                    {isRecording
+                      ? "Dữ liệu mô phỏng đang được cập nhật mỗi giây."
+                      : "Bắt đầu ghi để tạo một phiên tập mới."}
+                  </p>
+                </div>
 
-                      <span className="unit-pill">5 Flex · 5 FSR</span>
-                    </div>
+                <div className="duration-display">
+                  <span>Thời lượng</span>
+                  <strong>
+                    {formatDuration(elapsedSeconds)}
+                  </strong>
+                </div>
+              </div>
 
-                    <HandDiagram
-                      fingers={fingers}
-                      selected={selectedFinger}
-                      onSelect={setSelectedFinger}
+              <label className="field-label" htmlFor="sessionName">
+                Tên phiên tập
+              </label>
+
+              <input
+                id="sessionName"
+                className="text-input"
+                value={sessionName}
+                onChange={(event) =>
+                  setSessionName(event.target.value)
+                }
+                disabled={isRecording}
+                placeholder="Nhập tên phiên tập"
+              />
+
+              <div className="control-actions">
+                {!isRecording ? (
+                  <button
+                    className="button button-primary"
+                    onClick={startRecording}
+                  >
+                    ▶ Bắt đầu ghi
+                  </button>
+                ) : (
+                  <button
+                    className="button button-danger"
+                    onClick={stopRecording}
+                  >
+                    ■ Dừng ghi
+                  </button>
+                )}
+
+                <button
+                  className="button button-secondary"
+                  onClick={saveSession}
+                  disabled={isRecording}
+                >
+                  Lưu phiên tập
+                </button>
+
+                <button
+                  className="button button-ghost"
+                  onClick={resetCurrentData}
+                  disabled={isRecording}
+                >
+                  Làm mới
+                </button>
+              </div>
+            </section>
+
+            <section className="section-block">
+              <div className="section-heading">
+                <div>
+                  <h3>Flex trung bình từng ngón</h3>
+                  <p>
+                    Tính riêng từng ngón từ các mẫu đo hiện tại.
+                  </p>
+                </div>
+                <span className="subtle-tag">
+                  5 ngón tay
+                </span>
+              </div>
+
+              <FingerCards values={currentFingerAverages} />
+
+              <FingerAverageChart
+                values={currentFingerAverages}
+              />
+            </section>
+
+            <section className="section-block">
+              <div className="section-heading">
+                <div>
+                  <h3>Diễn biến Flex theo thời gian</h3>
+                  <p>
+                    Mỗi biểu đồ thể hiện một ngón tay độc lập.
+                  </p>
+                </div>
+              </div>
+
+              <div className="chart-grid">
+                {FINGERS.map((finger, index) => (
+                  <LineChart
+                    key={finger}
+                    title={finger}
+                    samples={currentSamples}
+                    fingerIndex={index}
+                    color={[
+                      "#2563eb",
+                      "#0d9488",
+                      "#7c3aed",
+                      "#ea580c",
+                      "#db2777",
+                    ][index]}
+                  />
+                ))}
+              </div>
+            </section>
+
+            <section className="section-block">
+              <div className="section-heading">
+                <div>
+                  <h3>Phiên tập gần đây</h3>
+                  <p>
+                    {sessions.length} phiên đã lưu trên thiết bị này.
+                  </p>
+                </div>
+
+                <button
+                  className="text-button"
+                  onClick={() => setPage("history")}
+                >
+                  Xem tất cả →
+                </button>
+              </div>
+
+              {sessions.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">◷</div>
+                  <h3>Chưa có phiên tập nào</h3>
+                  <p>
+                    Bắt đầu ghi dữ liệu rồi lưu phiên để xem
+                    lịch sử và so sánh kết quả.
+                  </p>
+                </div>
+              ) : (
+                <div className="session-list">
+                  {sessions.slice(0, 3).map((session) => (
+                    <SessionRow
+                      key={session.id}
+                      session={session}
+                      onView={() => {
+                        setSelectedSessionId(session.id);
+                        setPage("analysis");
+                      }}
                     />
+                  ))}
+                </div>
+              )}
+            </section>
+          </>
+        )}
 
-                    <div className="selected-readings">
-                      <div className="reading-card">
-                        <span>{selected.name} · Flex</span>
-                        <strong>{selected.flex}%</strong>
+        {page === "analysis" && (
+          <section className="section-block page-section">
+            <div className="section-heading">
+              <div>
+                <h3>Phân tích theo từng phiên</h3>
+                <p>
+                  Xem Flex trung bình của từng ngón trong
+                  phiên được chọn.
+                </p>
+              </div>
 
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: `${selected.flex}%`,
-                              background: COLORS[selectedFinger],
-                            }}
-                          />
+              {selectedSession && (
+                <button
+                  className="button button-secondary"
+                  onClick={() =>
+                    exportSessionCSV(selectedSession)
+                  }
+                >
+                  ↓ Xuất CSV
+                </button>
+              )}
+            </div>
+
+            {sessions.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">⌁</div>
+                <h3>Chưa có dữ liệu lịch sử</h3>
+                <p>
+                  Hãy tạo và lưu một phiên tập trước khi phân tích.
+                </p>
+                <button
+                  className="button button-primary"
+                  onClick={() => setPage("overview")}
+                >
+                  Tạo phiên tập
+                </button>
+              </div>
+            ) : (
+              <>
+                <label className="field-label" htmlFor="sessionSelect">
+                  Chọn phiên tập
+                </label>
+
+                <select
+                  id="sessionSelect"
+                  className="text-input"
+                  value={selectedSessionId || sessions[0].id}
+                  onChange={(event) =>
+                    setSelectedSessionId(event.target.value)
+                  }
+                >
+                  {sessions.map((session) => (
+                    <option key={session.id} value={session.id}>
+                      {session.name} — {formatDate(session.date)}
+                    </option>
+                  ))}
+                </select>
+
+                {(() => {
+                  const session =
+                    selectedSession ?? sessions[0];
+
+                  if (!session) return null;
+
+                  return (
+                    <>
+                      <div className="session-summary">
+                        <div>
+                          <span>Tên phiên</span>
+                          <strong>{session.name}</strong>
+                        </div>
+
+                        <div>
+                          <span>Ngày thực hiện</span>
+                          <strong>{formatDate(session.date)}</strong>
+                        </div>
+
+                        <div>
+                          <span>Thời lượng</span>
+                          <strong>
+                            {formatDuration(session.duration)}
+                          </strong>
+                        </div>
+
+                        <div>
+                          <span>Số mẫu đo</span>
+                          <strong>{session.samples.length}</strong>
                         </div>
                       </div>
 
-                      <div className="reading-card">
-                        <span>{selected.name} · FSR</span>
-                        <strong>
-                          {selected.fsr} <small>/ 1023</small>
-                        </strong>
-
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: `${(selected.fsr / 1023) * 100}%`,
-                              background: COLORS[selectedFinger],
-                            }}
-                          />
+                      <div className="section-heading inner-heading">
+                        <div>
+                          <h3>Flex trung bình của từng ngón</h3>
+                          <p>
+                            Mỗi ô là kết quả trung bình của một
+                            ngón trong toàn bộ phiên này.
+                          </p>
                         </div>
                       </div>
-                    </div>
-                  </section>
 
-                  <section className="panel action-panel">
-                    <div className="panel-heading">
+                      <FingerCards
+                        values={session.fingerAverages}
+                      />
+
+                      <FingerAverageChart
+                        values={session.fingerAverages}
+                      />
+
+                      <div className="section-heading inner-heading">
+                        <div>
+                          <h3>Biểu đồ từng ngón trong phiên</h3>
+                          <p>
+                            Trục ngang là thứ tự mẫu đo; trục dọc
+                            là giá trị Flex.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="chart-grid">
+                        {FINGERS.map((finger, index) => (
+                          <LineChart
+                            key={finger}
+                            title={finger}
+                            samples={session.samples}
+                            fingerIndex={index}
+                            color={[
+                              "#2563eb",
+                              "#0d9488",
+                              "#7c3aed",
+                              "#ea580c",
+                              "#db2777",
+                            ][index]}
+                          />
+                        ))}
+                      </div>
+                    </>
+                  );
+                })()}
+              </>
+            )}
+          </section>
+        )}
+
+        {page === "history" && (
+          <section className="section-block page-section">
+            <div className="section-heading">
+              <div>
+                <h3>Lịch sử phiên tập</h3>
+                <p>
+                  Xem kết quả riêng của từng ngón, mở biểu đồ
+                  hoặc xuất dữ liệu.
+                </p>
+              </div>
+
+              <button
+                className="button button-secondary"
+                onClick={exportAllSessionsCSV}
+                disabled={sessions.length === 0}
+              >
+                ↓ Xuất tất cả CSV
+              </button>
+            </div>
+
+            {sessions.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">◷</div>
+                <h3>Chưa có dữ liệu lịch sử</h3>
+                <p>
+                  Những phiên được lưu sẽ xuất hiện tại đây.
+                </p>
+                <button
+                  className="button button-primary"
+                  onClick={() => setPage("overview")}
+                >
+                  Bắt đầu tập
+                </button>
+              </div>
+            ) : (
+              <div className="history-list">
+                {sessions.map((session) => (
+                  <article
+                    className="history-card"
+                    key={session.id}
+                  >
+                    <div className="history-card-header">
                       <div>
-                        <h2>Điều khiển phiên tập</h2>
-                        <p>Ghi nhận và lưu kết quả đo.</p>
+                        <h3>{session.name}</h3>
+                        <p>{formatDate(session.date)}</p>
                       </div>
 
-                      <span
-                        className={`mini-state ${
-                          isRecording ? "on" : ""
-                        }`}
-                      >
-                        {isRecording
-                          ? "ĐANG GHI"
-                          : "CHỜ BẮT ĐẦU"}
+                      <span className="subtle-tag">
+                        {session.samples.length} mẫu
                       </span>
                     </div>
 
-                    <label
-                      className="field-label"
-                      htmlFor="session-label"
-                    >
-                      Tên phiên tập
-                    </label>
-
-                    <input
-                      id="session-label"
-                      value={sessionLabel}
-                      maxLength={60}
-                      onChange={(e) => setSessionLabel(e.target.value)}
-                      placeholder="Ví dụ: Buổi tập sáng"
-                      disabled={isRecording}
-                    />
-
-                    <div className="timer-box">
-                      <span>THỜI GIAN ĐÃ TẬP</span>
-                      <strong>{formatTime(elapsed)}</strong>
-                      <small>
-                        {samples.length} mẫu dữ liệu · chu kỳ khoảng
-                        1,2 giây
-                      </small>
-                    </div>
-
-                    {!isRecording ? (
-                      <button
-                        className="btn btn-primary full-btn"
-                        onClick={startRecording}
-                      >
-                        ▶ Bắt đầu tập
-                      </button>
-                    ) : (
-                      <button
-                        className="btn btn-danger full-btn"
-                        onClick={stopRecording}
-                      >
-                        ■ Dừng và lưu phiên
-                      </button>
-                    )}
-
-                    <button
-                      className="btn btn-light full-btn"
-                      onClick={exportSamples}
-                      disabled={!samples.length}
-                    >
-                      ↓ Xuất dữ liệu CSV
-                    </button>
-
-                    <div className="capture-info">
-                      <div>
-                        <span>Kênh Flex</span>
-                        <strong>5</strong>
-                      </div>
-                      <div>
-                        <span>Kênh FSR</span>
-                        <strong>5</strong>
-                      </div>
-                      <div>
-                        <span>Mẫu hiện tại</span>
-                        <strong>{samples.length}/300</strong>
-                      </div>
-                      <div>
-                        <span>Nguồn dữ liệu</span>
-                        <strong>Mô phỏng</strong>
-                      </div>
-                    </div>
-                  </section>
-                </div>
-
-                <section className="panel section-gap">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>So sánh giữa các ngón</h2>
-                      <p>
-                        Giá trị hiện tại; không phải đánh giá y khoa.
-                      </p>
-                    </div>
-
-                    <span className="unit-pill">
-                      Phân tích nhanh
-                    </span>
-                  </div>
-
-                  <div className="range-cards">
-                    <div>
-                      <span>Khoảng chênh Flex</span>
-                      <strong>{flexRange}%</strong>
-                      <small>Giá trị lớn nhất trừ nhỏ nhất</small>
-                    </div>
-
-                    <div>
-                      <span>Khoảng chênh FSR</span>
-                      <strong>{fsrRange}</strong>
-                      <small>Chênh lệch tín hiệu thô</small>
-                    </div>
-                  </div>
-
-                  <div className="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Ngón tay</th>
-                          <th>Flex (%)</th>
-                          <th>FSR (raw)</th>
-                          <th>So với Flex trung bình</th>
-                          <th>Trạng thái</th>
-                        </tr>
-                      </thead>
-
-                      <tbody>
-                        {fingers.map((f, i) => (
-                          <tr
-                            key={f.name}
-                            className={
-                              selectedFinger === i ? "row-selected" : ""
-                            }
-                            onClick={() => setSelectedFinger(i)}
-                          >
-                            <td>
-                              <span className="finger-cell">
-                                <i style={{ background: COLORS[i] }} />
-                                {f.name}
-                              </span>
-                            </td>
-
-                            <td>{f.flex}%</td>
-                            <td>{f.fsr}</td>
-
-                            <td>
-                              {f.flex - averageFlex > 0 ? "+" : ""}
-                              {f.flex - averageFlex}%
-                            </td>
-
-                            <td>
-                              <span className="neutral-tag">
-                                Mô phỏng
-                              </span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </section>
-
-                <div className="content-grid section-gap">
-                  <LineChart
-                    title="Flex trung bình"
-                    subtitle="Xu hướng độ gập trung bình của bàn tay"
-                    data={[averageFlexSeries]}
-                    colors={["#159782"]}
-                    maxValue={100}
-                    unit="%"
-                  />
-
-                  <LineChart
-                    title="FSR trung bình"
-                    subtitle="Xu hướng tín hiệu lực nắm thô"
-                    data={[averageFsrSeries]}
-                    colors={["#4D8FE8"]}
-                    maxValue={1023}
-                    unit="raw"
-                  />
-                </div>
-              </>
-            )}
-
-            {view === "analytics" && (
-              <>
-                <section className="panel section-gap">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>Phân tích theo từng ngón</h2>
-                      <p>
-                        Đối chiếu năm kênh cảm biến theo thời gian.
-                      </p>
-                    </div>
-
-                    <label className="select-wrap">
-                      <span>Chỉ số</span>
-
-                      <select
-                        value={metric}
-                        onChange={(e) =>
-                          setMetric(e.target.value as Metric)
-                        }
-                      >
-                        <option value="fingerFlex">Flex (%)</option>
-                        <option value="fingerFsr">FSR (raw)</option>
-                      </select>
-                    </label>
-                  </div>
-                </section>
-
-                <LineChart
-                  title={
-                    metric === "fingerFlex"
-                      ? "Biểu đồ Flex — 5 ngón tay"
-                      : "Biểu đồ FSR — 5 ngón tay"
-                  }
-                  subtitle={
-                    metric === "fingerFlex"
-                      ? "Độ gập mô phỏng theo từng mẫu"
-                      : "Tín hiệu FSR thô theo từng mẫu"
-                  }
-                  data={fingerSeries}
-                  colors={COLORS}
-                  maxValue={metric === "fingerFlex" ? 100 : 1023}
-                  unit={metric === "fingerFlex" ? "%" : "raw"}
-                  multi
-                />
-
-                <div className="content-grid section-gap">
-                  <section className="panel">
-                    <div className="panel-heading">
-                      <div>
-                        <h2>Flex theo ngón</h2>
-                        <p>
-                          Giá trị hiện tại trên thang 0–100%.
-                        </p>
-                      </div>
-                    </div>
-
-                    {fingers.map((f, i) => (
-                      <div className="metric-row" key={f.name}>
-                        <div>
-                          <span>{f.name}</span>
-                          <strong>{f.flex}%</strong>
+                    <div className="history-finger-grid">
+                      {FINGERS.map((finger, index) => (
+                        <div
+                          className="history-finger"
+                          key={finger}
+                        >
+                          <span>{finger}</span>
+                          <strong>
+                            {(
+                              session.fingerAverages[index] ?? 0
+                            ).toFixed(2)}
+                          </strong>
                         </div>
-
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: `${f.flex}%`,
-                              background: COLORS[i],
-                            }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-
-                  <section className="panel">
-                    <div className="panel-heading">
-                      <div>
-                        <h2>FSR theo ngón</h2>
-                        <p>
-                          Tín hiệu thô trên thang hiển thị 0–1023.
-                        </p>
-                      </div>
-                    </div>
-
-                    {fingers.map((f, i) => (
-                      <div className="metric-row" key={f.name}>
-                        <div>
-                          <span>{f.name}</span>
-                          <strong>{f.fsr}</strong>
-                        </div>
-
-                        <div className="progress-track">
-                          <div
-                            className="progress-fill"
-                            style={{
-                              width: `${(f.fsr / 1023) * 100}%`,
-                              background: COLORS[i],
-                            }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </section>
-                </div>
-
-                <section className="panel section-gap">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>Giá trị mới nhất</h2>
-                      <p>
-                        Chọn một ngón để xem chi tiết ở trang Tổng quan.
-                      </p>
-                    </div>
-
-                    <button
-                      className="btn btn-light"
-                      onClick={() => setView("overview")}
-                    >
-                      Xem bàn tay →
-                    </button>
-                  </div>
-
-                  <div className="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Ngón</th>
-                          <th>Flex (%)</th>
-                          <th>FSR (raw)</th>
-                          <th>Thanh Flex</th>
-                        </tr>
-                      </thead>
-
-                      <tbody>
-                        {fingers.map((f, i) => (
-                          <tr key={f.name}>
-                            <td>
-                              <span className="finger-cell">
-                                <i style={{ background: COLORS[i] }} />
-                                {f.name}
-                              </span>
-                            </td>
-
-                            <td>{f.flex}%</td>
-                            <td>{f.fsr}</td>
-
-                            <td>
-                              <div className="progress-track table-progress">
-                                <div
-                                  className="progress-fill"
-                                  style={{
-                                    width: `${f.flex}%`,
-                                    background: COLORS[i],
-                                  }}
-                                />
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </section>
-              </>
-            )}
-          </>
-        )}
-
-        {view === "history" && (
-          <>
-            <section className="stats-grid">
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon teal">▤</span>
-                  <span className="stat-label">TỔNG PHIÊN TẬP</span>
-                </div>
-                <div className="stat-value">{sessions.length}</div>
-                <p className="stat-description">
-                  Lưu trên trình duyệt này
-                </p>
-              </div>
-
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon blue">◷</span>
-                  <span className="stat-label">TỔNG THỜI GIAN</span>
-                </div>
-                <div className="stat-value time-value">
-                  {formatTime(totalDuration)}
-                </div>
-                <p className="stat-description">
-                  Tổng thời lượng các phiên
-                </p>
-              </div>
-
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon purple">↗</span>
-                  <span className="stat-label">FLEX GẦN NHẤT</span>
-                </div>
-                <div className="stat-value">
-                  {sessions[0] ? `${sessions[0].avgFlex}%` : "—"}
-                </div>
-                <p className="stat-description">
-                  Trung bình phiên mới nhất
-                </p>
-              </div>
-
-              <div className="stat-card">
-                <div className="stat-top">
-                  <span className="stat-icon orange">◉</span>
-                  <span className="stat-label">FSR GẦN NHẤT</span>
-                </div>
-                <div className="stat-value">
-                  {sessions[0]?.avgFsr ?? "—"}
-                </div>
-                <p className="stat-description">
-                  Giá trị ADC trung bình
-                </p>
-              </div>
-            </section>
-
-            <section className="panel section-gap">
-              <div className="panel-heading">
-                <div>
-                  <h2>Lịch sử phiên tập</h2>
-                  <p>
-                    Lịch sử được giữ lại sau khi tải lại trang trên cùng
-                    trình duyệt.
-                  </p>
-                </div>
-
-                <div className="header-actions">
-                  <button
-                    className="btn btn-light"
-                    onClick={exportHistory}
-                    disabled={!sessions.length}
-                  >
-                    ↓ Xuất lịch sử CSV
-                  </button>
-
-                  <button
-                    className="btn btn-outline-danger"
-                    onClick={clearHistory}
-                    disabled={!sessions.length}
-                  >
-                    Xóa lịch sử
-                  </button>
-                </div>
-              </div>
-
-              {!sessions.length ? (
-                <div className="empty-state">
-                  <div className="empty-icon">◷</div>
-                  <strong>Chưa có phiên tập nào</strong>
-                  <p>
-                    Bắt đầu tập rồi nhấn “Dừng và lưu phiên” để tạo lịch
-                    sử.
-                  </p>
-
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => setView("overview")}
-                  >
-                    Đi đến tổng quan
-                  </button>
-                </div>
-              ) : (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Phiên</th>
-                        <th>Tên / thời điểm</th>
-                        <th>Thời lượng</th>
-                        <th>Flex TB</th>
-                        <th>FSR TB</th>
-                        <th>Số mẫu</th>
-                      </tr>
-                    </thead>
-
-                    <tbody>
-                      {sessions.map((s, i) => (
-                        <tr key={s.id}>
-                          <td>
-                            <strong>#{sessions.length - i}</strong>
-                          </td>
-                          <td>{s.date}</td>
-                          <td>{formatTime(s.duration)}</td>
-                          <td>{s.avgFlex}%</td>
-                          <td>{s.avgFsr}</td>
-                          <td>{s.samples}</td>
-                        </tr>
                       ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </section>
+                    </div>
 
-            <section className="panel section-gap">
-              <div className="panel-heading">
-                <div>
-                  <h2>So sánh các phiên</h2>
-                  <p>
-                    Chênh lệch trung bình so với phiên kế tiếp trong lịch
-                    sử.
-                  </p>
-                </div>
+                    <div className="history-card-footer">
+                      <span>
+                        Thời lượng:{" "}
+                        {formatDuration(session.duration)}
+                      </span>
+
+                      <div className="history-actions">
+                        <button
+                          className="text-button"
+                          onClick={() => {
+                            setSelectedSessionId(session.id);
+                            setPage("analysis");
+                          }}
+                        >
+                          Xem phân tích
+                        </button>
+
+                        <button
+                          className="text-button"
+                          onClick={() => exportSessionCSV(session)}
+                        >
+                          Xuất CSV
+                        </button>
+
+                        <button
+                          className="text-button danger-text"
+                          onClick={() => deleteSession(session.id)}
+                        >
+                          Xóa
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))}
               </div>
-
-              {sessions.length < 2 ? (
-                <div className="empty-state">
-                  Cần ít nhất hai phiên đã lưu để so sánh.
-                </div>
-              ) : (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Phiên</th>
-                        <th>Flex TB</th>
-                        <th>Chênh Flex</th>
-                        <th>FSR TB</th>
-                        <th>Chênh FSR</th>
-                      </tr>
-                    </thead>
-
-                    <tbody>
-                      {sessions.map((s, i) => {
-                        const prev = sessions[i + 1];
-                        const fd = prev
-                          ? s.avgFlex - prev.avgFlex
-                          : null;
-                        const sd = prev
-                          ? s.avgFsr - prev.avgFsr
-                          : null;
-
-                        return (
-                          <tr key={s.id}>
-                            <td>#{sessions.length - i}</td>
-                            <td>{s.avgFlex}%</td>
-                            <td>
-                              {fd === null
-                                ? "—"
-                                : `${fd > 0 ? "+" : ""}${fd}%`}
-                            </td>
-                            <td>{s.avgFsr}</td>
-                            <td>
-                              {sd === null
-                                ? "—"
-                                : `${sd > 0 ? "+" : ""}${sd}`}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </section>
-          </>
+            )}
+          </section>
         )}
 
-        <footer className="footer">
-          Hand Rehab Analytics · Prototype · Dữ liệu mô phỏng, không phải
-          phép đo lâm sàng.
+        <footer className="app-footer">
+          <p>
+            Hand Rehab Analytics · Công cụ theo dõi dữ liệu Flex
+            mang tính thử nghiệm.
+          </p>
+          <p>
+            Giá trị mô phỏng không phải chẩn đoán y tế hoặc
+            thước đo phục hồi đã được kiểm định.
+          </p>
         </footer>
       </main>
     </div>
+  );
+}
+
+function SessionRow({
+  session,
+  onView,
+}: {
+  session: Session;
+  onView: () => void;
+}) {
+  return (
+    <button className="session-row" onClick={onView}>
+      <div className="session-row-icon">⌁</div>
+
+      <div className="session-row-main">
+        <strong>{session.name}</strong>
+        <span>{formatDate(session.date)}</span>
+      </div>
+
+      <div className="session-row-values">
+        {FINGERS.map((finger, index) => (
+          <div key={finger}>
+            <span>{finger}</span>
+            <strong>
+              {(session.fingerAverages[index] ?? 0).toFixed(1)}
+            </strong>
+          </div>
+        ))}
+      </div>
+
+      <span className="session-row-arrow">→</span>
+    </button>
   );
 }
