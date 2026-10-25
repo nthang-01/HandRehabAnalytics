@@ -387,9 +387,9 @@ export default function App() {
     (session) => session.id === selectedSessionId
   );
 
-  const latestSession = sessions[0];
+  
 
-  const sessionTrend = [...sessions].reverse();
+
 
   function startRecording() {
     setCurrentSamples([
